@@ -41,6 +41,7 @@ type Network struct {
 	MAC  net.HardwareAddr
 	Addr netip.Prefix
 	DHCP bool
+	MTU  int
 }
 
 func (nw Network) Validate() error {
@@ -49,6 +50,9 @@ func (nw Network) Validate() error {
 	}
 	if nw.Addr.IsValid() && nw.DHCP {
 		return errors.New("cannot specify both addr and dhcp")
+	}
+	if nw.MTU < 68 || nw.MTU > 9000 {
+		return errors.New("MTU must be between 68 and 9000")
 	}
 	return nil
 }
@@ -104,6 +108,11 @@ func SetupVM(ctx context.Context, nws []Network, debug bool) (func(context.Conte
 			"mac":   nw.MAC.String(),
 			"iface": iface.Attrs().Name,
 		}))
+
+		if err := netlink.LinkSetMTU(iface, nw.MTU); err != nil {
+			log.G(ctx).WithError(err).Error("failed to set MTU on virtio interface")
+			return nil, nil, fmt.Errorf("failed to set MTU on virtio interface %s: %w", iface.Attrs().Name, err)
+		}
 
 		if nw.DHCP {
 			eg.Go(func() error {

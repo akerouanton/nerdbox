@@ -33,7 +33,7 @@ type networks []vmnetworking.Network
 func (n *networks) String() string {
 	ss := make([]string, 0, len(*n))
 	for _, nw := range *n {
-		ss = append(ss, fmt.Sprintf("mac=%s,addr=%s,dhcp=%t", nw.MAC, nw.Addr, nw.DHCP))
+		ss = append(ss, fmt.Sprintf("mac=%s,addr=%s,dhcp=%t,mtu=%d", nw.MAC, nw.Addr, nw.DHCP, nw.MTU))
 	}
 	return strings.Join(ss, " ")
 }
@@ -69,6 +69,12 @@ func (n *networks) Set(value string) error {
 				return fmt.Errorf("invalid DHCP field: %w", err)
 			}
 			nw.DHCP = dhcp
+		case "mtu":
+			mtu, err := strconv.Atoi(parts[1])
+			if err != nil {
+				return fmt.Errorf("invalid MTU field: %w", err)
+			}
+			nw.MTU = mtu
 		default:
 			return fmt.Errorf("invalid network %q: unknown field %q", value, parts[0])
 		}

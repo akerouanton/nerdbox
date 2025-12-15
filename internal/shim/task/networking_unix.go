@@ -43,6 +43,7 @@ type network struct {
 	addr6    netip.Prefix     // addr6 is the IPv6 address + subnet mask of the network interface
 	features uint32           // features is a bitmask of virtio-net features enabled on this network endpoint
 	vfkit    bool             // vfkit is a boolean flag indicating whether libkrun must send the VFKIT magic sequence after connecting to the socket.
+	mtu      int              // mtu is the MTU of the network interface.
 }
 
 const (
@@ -57,6 +58,7 @@ const (
 	addrField     = "addr"
 	featuresField = "features" // features is a bitwise-OR separated list of virtio-net features. See https://docs.oasis-open.org/virtio/virtio/v1.3/csd01/virtio-v1.3-csd01.html#x1-2370003
 	vfkitField    = "vfkit"    // vfkit is a boolean flag indicating whether libkrun must send the VFKIT magic sequence after connecting to the socket.
+	mtuField      = "mtu"      // mtu is the MTU of the network interface.
 
 	nwModeUnixgram   = "unixgram"
 	nwModeUnixstream = "unixstream"
@@ -88,7 +90,7 @@ func (p *networksProvider) FromBundle(ctx context.Context, b *bundle.Bundle) err
 }
 
 func parseNetwork(annotation string) (network, error) {
-	var n network
+	n := network{mtu: 1500}
 
 	for _, field := range strings.Split(annotation, ",") {
 		parts := strings.SplitN(field, "=", 2)
@@ -149,6 +151,12 @@ func parseNetwork(annotation string) (network, error) {
 				return network{}, fmt.Errorf("parsing vfkit field: %w", err)
 			}
 			n.vfkit = vfkit
+		case mtuField:
+			mtu, err := strconv.Atoi(value)
+			if err != nil {
+				return network{}, fmt.Errorf("parsing MTU field: %w", err)
+			}
+			n.mtu = mtu
 		default:
 			return network{}, fmt.Errorf("unknown network field: %s", key)
 		}
