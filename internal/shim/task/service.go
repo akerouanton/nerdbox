@@ -45,6 +45,7 @@ import (
 	"github.com/containerd/nerdbox/internal/kvm"
 	"github.com/containerd/nerdbox/internal/nwcfg"
 	"github.com/containerd/nerdbox/internal/shim/task/bundle"
+	"github.com/containerd/nerdbox/internal/sigstop"
 	"github.com/containerd/nerdbox/internal/vm"
 )
 
@@ -102,6 +103,11 @@ type service struct {
 }
 
 func (s *service) RegisterTTRPC(server *ttrpc.Server) error {
+	if v := os.Getenv("NERDBOX_SIGSTOP"); v != "" {
+		// Raise a SIGSTOP to pause the shim until a debugger is attached. This
+		// should help us catch weird bugs that happen every once in a while.
+		sigstop.Raise()
+	}
 	taskAPI.RegisterTTRPCTaskService(server, s)
 	return nil
 }
