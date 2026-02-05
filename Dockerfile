@@ -110,10 +110,22 @@ EOT
 
 RUN <<EOT
     set -e
+    HOST_ARCH=$(uname -m)
+    # Normalize host arch to match KERNEL_ARCH naming
+    case "${HOST_ARCH}" in
+        aarch64) HOST_ARCH=arm64 ;;
+    esac
+    CROSS_COMPILE=""
+    if [ "${HOST_ARCH}" != "${KERNEL_ARCH}" ]; then
+        case "${KERNEL_ARCH}" in
+            arm64) CROSS_COMPILE=aarch64-linux-gnu- ;;
+            x86_64) CROSS_COMPILE=x86_64-linux-gnu- ;;
+        esac
+    fi
     cd linux
     mkdir /build
     case "${KERNEL_ARCH}" in
-        x86_64) cp vmlinux /build/kernel ;;
+        x86_64) cp vmlinux /build/kernel && ${CROSS_COMPILE}strip /build/kernel ;;
         arm64) cp arch/arm64/boot/Image /build/kernel ;;
         *) echo "Unsupported architecture: ${KERNEL_ARCH} " ; exit 1 ;;
     esac
