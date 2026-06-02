@@ -32,6 +32,7 @@ import (
 
 	"github.com/containerd/containerd/v2/pkg/stdio"
 	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
 )
 
 type streamCreator interface {
@@ -46,7 +47,120 @@ func generateStreamID(prefix string) string {
 	return fmt.Sprintf("%s-%d-%s", prefix, time.Now().UnixNano(), base64.RawURLEncoding.EncodeToString(b[:]))
 }
 
-func (s *service) forwardIO(ctx context.Context, ss streamCreator, idPrefix string, sio stdio.Stdio) (stdio.Stdio, func(ctx context.Context) error, error) {
+// ioFSMState represents the lifecycle state of an ioForwarder.
+type ioFSMState int
+
+const (
+	// ioStateForwarding: copy goroutines are running; streams are open and
+	// must not be closed.
+	ioStateForwarding ioFSMState = iota
+
+	// ioStateDrained: all copy goroutines have returned; it is now safe to
+	// close the underlying stream connections.
+	ioStateDrained
+
+	// ioStateClosed: streams have been closed; terminal state.
+	ioStateClosed
+)
+
+func (s ioFSMState) String() string {
+	switch s {
+	case ioStateForwarding:
+		return "Forwarding"
+	case ioStateDrained:
+		return "Drained"
+	case ioStateClosed:
+		return "Closed"
+	default:
+		return fmt.Sprintf("ioFSMState(%d)", int(s))
+	}
+}
+
+// ioForwarder manages the host-side IO streams that bridge host FIFOs/files
+// to the VM vsock streams.  It is a small explicit state machine with three
+// states:
+//
+//	Forwarding --> Drained --> Closed
+//	     |                     ^
+//	     +-- ForceShutdown() --+
+//	         (streams closed before full drain)
+//
+// Forwarding: copy goroutines are running; streams must remain open.
+// Drained:    copy goroutines finished; streams may now be closed.
+// Closed:     streams closed; terminal state.
+//
+// The only valid operation after construction is Shutdown, which drives the
+// forwarder from Forwarding through Drained to Closed in order, enforcing
+// the invariant that we never close a stream that a goroutine is still
+// reading from.
+type ioForwarder struct {
+	mu      sync.Mutex
+	state   ioFSMState
+	streams [3]io.ReadWriteCloser // vsock connections; [0]=stdin [1]=stdout [2]=stderr
+	drained chan struct{}         // closed by copy goroutines when all output is drained
+}
+
+// Shutdown drives the forwarder to Closed, waiting for copy goroutines to
+// drain first.  It is safe to call from multiple goroutines; all concurrent
+// callers block until the first call completes the shutdown, then all return.
+// Subsequent calls after shutdown is complete return nil immediately.
+//
+// If ctx carries no deadline, a 30-second timeout is applied so a wedged
+// guest cannot pin cleanup indefinitely.  ctx.Done() is only reached in
+// exceptional cases (VM crash, vminitd hang, kernel wedge); in normal
+// operation the drained channel closes on its own when the container process
+// exits and propagates EOF through the vsock connections.
+func (f *ioForwarder) Shutdown(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	switch f.state {
+	case ioStateForwarding:
+		// Normal path: wait for drain, then close.
+	case ioStateClosed:
+		// Already shut down; idempotent.
+		return nil
+	default:
+		return fmt.Errorf("ioForwarder.Shutdown: unexpected state %s", f.state)
+	}
+
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+	}
+
+	select {
+	case <-f.drained:
+		// Goroutines finished naturally; transition Forwarding → Drained → Closed.
+		f.state = ioStateDrained
+	case <-ctx.Done():
+		// Forceful shutdown: transition Forwarding → Closed, skipping Drained.
+	}
+
+	// Transition to Closed: close all stream connections.
+	for i, c := range f.streams {
+		if c != nil && (i != 2 || c != f.streams[1]) {
+			c.Close()
+		}
+	}
+	f.state = ioStateClosed
+
+	return nil
+}
+
+// ForceShutdown closes the stream connections immediately without waiting for
+// copy goroutines to drain.  Use this when cleanup must be immediate and data
+// loss is acceptable.  For graceful shutdown, use Shutdown.
+func (f *ioForwarder) ForceShutdown() error {
+	// Generate a canceled context to signal to Shutdown to skip the drain phase.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	return f.Shutdown(ctx)
+}
+
+func (s *service) forwardIO(ctx context.Context, ss streamCreator, idPrefix string, sio stdio.Stdio) (_ stdio.Stdio, _ *ioForwarder, retErr error) {
 	pio := sio
 	if pio.IsNull() {
 		return pio, nil, nil
@@ -68,8 +182,6 @@ func (s *service) forwardIO(ctx context.Context, ss streamCreator, idPrefix stri
 		if err != nil {
 			return stdio.Stdio{}, nil, err
 		}
-
-		//pio.io, err = runc.NewPipeIO(ioUID, ioGID, withConditionalIO(stdio))
 	case "file":
 		filePath := u.Path
 		if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
@@ -95,53 +207,27 @@ func (s *service) forwardIO(ctx context.Context, ss streamCreator, idPrefix stri
 		return stdio.Stdio{}, nil, err
 	}
 
+	fwd := &ioForwarder{
+		state:   ioStateForwarding,
+		streams: streams,
+		drained: make(chan struct{}),
+	}
+
 	defer func() {
 		if err != nil {
-			for i, c := range streams {
-				if c != nil && (i != 2 || c != streams[1]) {
-					c.Close()
-				}
+			if err := fwd.ForceShutdown(); err != nil {
+				log.G(ctx).WithFields(log.Fields{
+					"error":    err,
+					"orig_err": retErr,
+				}).Error("failed to force shutdown io forwarder")
 			}
 		}
 	}()
-	ioDone := make(chan struct{})
-	if err = copyStreams(ctx, streams, sio.Stdin, sio.Stdout, sio.Stderr, ioDone); err != nil {
+
+	if err = copyStreams(ctx, streams, sio.Stdin, sio.Stdout, sio.Stderr, fwd.drained); err != nil {
 		return stdio.Stdio{}, nil, err
 	}
-	return pio, func(ctx context.Context) error {
-		// Wait for the copy goroutines to finish draining before closing
-		// the stream connections. Closing first causes goroutines that are
-		// mid-Read to see "use of closed network connection" and return
-		// early, dropping bytes still buffered in the kernel socket receive
-		// queue (the close-before-drain race).
-		//
-		// In normal operation ioDone always fires on its own: the container
-		// process exiting closes the runc pipe, vminitd's copy goroutine
-		// sees EOF and closes its vsock conn, which propagates EOF to the
-		// host copy goroutines here. ctx.Done() is only reached in
-		// exceptional cases (VM crash, vminitd hang, kernel wedge).
-		//
-		// Ensure the wait is always bounded: if the caller did not provide
-		// a deadline, apply a default so a wedged guest cannot pin cleanup
-		// indefinitely.
-		if _, ok := ctx.Deadline(); !ok {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
-			defer cancel()
-		}
-		var err error
-		select {
-		case <-ioDone:
-		case <-ctx.Done():
-			err = ctx.Err()
-		}
-		for i, c := range streams {
-			if c != nil && (i != 2 || c != streams[1]) {
-				c.Close()
-			}
-		}
-		return err
-	}, nil
+	return pio, fwd, nil
 }
 
 func createStreams(ctx context.Context, ss streamCreator, idPrefix string, io stdio.Stdio) (_ stdio.Stdio, conns [3]io.ReadWriteCloser, err error) {

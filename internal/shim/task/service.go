@@ -83,20 +83,20 @@ func NewTaskService(ctx context.Context, sb sandbox.Sandbox, publisher shim.Publ
 }
 
 type container struct {
-	ioShutdown func(context.Context) error
+	io *ioForwarder
 
 	// forwarder is the UNIX socket forwarder for this specific container.
 	forwarder *socketForwarder
 
-	execShutdowns map[string]func(context.Context) error
+	execIO map[string]*ioForwarder
 }
 
 // shutdown shuts down the container's IO streams, socket forwarding, and all
 // exec IO streams.
 func (c *container) shutdown(ctx context.Context) error {
 	var errs []error
-	if c.ioShutdown != nil {
-		if err := c.ioShutdown(ctx); err != nil {
+	if c.io != nil {
+		if err := c.io.Shutdown(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("io shutdown: %w", err))
 		}
 	}
@@ -105,8 +105,8 @@ func (c *container) shutdown(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("socket forward shutdown: %w", err))
 		}
 	}
-	for execID, ioShutdown := range c.execShutdowns {
-		if err := ioShutdown(ctx); err != nil {
+	for execID, fwd := range c.execIO {
+		if err := fwd.Shutdown(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("exec %q io shutdown: %w", execID, err))
 		}
 	}
@@ -378,7 +378,7 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 		Terminal: r.Terminal,
 	}
 
-	cio, ioShutdown, err := s.forwardIO(ctx, s.sb, r.ID, rio)
+	cio, ioFwd, err := s.forwardIO(ctx, s.sb, r.ID, rio)
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
@@ -386,8 +386,10 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 	// Bind socket forwards on the VM before container creation so
 	// that crun can bind-mount the listener sockets into the container.
 	if err := bindSockets(ctx, s.sb, sfpr.entries); err != nil {
-		if err := ioShutdown(ctx); err != nil {
-			log.G(ctx).WithError(err).Error("failed to shutdown io after socket forwarding failure")
+		if ioFwd != nil {
+			if err := ioFwd.Shutdown(ctx); err != nil {
+				log.G(ctx).WithError(err).Error("failed to shutdown io after socket forwarding failure")
+			}
 		}
 		return nil, errgrpc.ToGRPC(err)
 	}
@@ -399,8 +401,8 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 
 	preCreate := time.Now()
 	c := &container{
-		ioShutdown:    ioShutdown,
-		execShutdowns: make(map[string]func(context.Context) error),
+		io:     ioFwd,
+		execIO: make(map[string]*ioForwarder),
 	}
 
 	tc := taskAPI.NewTTRPCTaskClient(vmc)
@@ -494,11 +496,11 @@ func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAP
 		s.mu.Lock()
 		if c, ok := s.containers[r.ID]; ok {
 			if r.ExecID != "" {
-				if ioShutdown, ok := c.execShutdowns[r.ExecID]; ok {
-					if err := ioShutdown(ctx); err != nil {
+				if fwd, ok := c.execIO[r.ExecID]; ok {
+					if err := fwd.Shutdown(ctx); err != nil {
 						log.G(ctx).WithError(err).WithField("exec", r.ExecID).Error("failed to shutdown exec io after delete")
 					}
-					delete(c.execShutdowns, r.ExecID)
+					delete(c.execIO, r.ExecID)
 				}
 			} else {
 				if err := c.shutdown(ctx); err != nil {
@@ -528,17 +530,17 @@ func (s *service) Exec(ctx context.Context, r *taskAPI.ExecProcessRequest) (*pty
 		Terminal: r.Terminal,
 	}
 
-	cio, ioShutdown, err := s.forwardIO(ctx, s.sb, r.ID+"-"+r.ExecID, rio)
+	cio, execFwd, err := s.forwardIO(ctx, s.sb, r.ID+"-"+r.ExecID, rio)
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
 
 	s.mu.Lock()
 	if c, ok := s.containers[r.ID]; ok {
-		c.execShutdowns[r.ExecID] = ioShutdown
+		c.execIO[r.ExecID] = execFwd
 	} else {
-		if ioShutdown != nil {
-			if err := ioShutdown(ctx); err != nil {
+		if execFwd != nil {
+			if err := execFwd.Shutdown(ctx); err != nil {
 				log.G(ctx).WithError(err).Error("failed to shutdown exec io after container not found")
 			}
 		}
@@ -559,11 +561,11 @@ func (s *service) Exec(ctx context.Context, r *taskAPI.ExecProcessRequest) (*pty
 	if err != nil {
 		s.mu.Lock()
 		if c, ok := s.containers[r.ID]; ok {
-			if ioShutdown, ok := c.execShutdowns[r.ExecID]; ok {
-				if err := ioShutdown(ctx); err != nil {
+			if fwd, ok := c.execIO[r.ExecID]; ok {
+				if err := fwd.Shutdown(ctx); err != nil {
 					log.G(ctx).WithError(err).Error("failed to shutdown exec io after exec failure")
 				}
-				delete(c.execShutdowns, r.ExecID)
+				delete(c.execIO, r.ExecID)
 			}
 		}
 		s.mu.Unlock()
